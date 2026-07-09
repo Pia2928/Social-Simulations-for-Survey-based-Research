@@ -2551,8 +2551,8 @@ def generate_england_agent_from_skeleton(
         "simulation_config": {
             "provider":    provider,
             "model":       model,
-            "temperature": 0.8,
-            "max_tokens":  512,
+            "temperature": 0.7,
+            "max_tokens":  1200,
             "notes":       "England Census 2021 representative population - large-scale batch",
         },
     }
