@@ -2210,11 +2210,67 @@ def _apply_wvs_correlations(s: dict) -> dict:
                 and random.random() < 0.85:
             s["wvs_member_religious"] = "Don't belong"
 
+        # No religion but HIGH religiosity is the inverse contradiction (a "not
+        # religious"/atheist person who rates God's importance ~9/10 and firmly
+        # believes). Pull the religiosity items DOWN — but not to zero: many
+        # unaffiliated people are agnostic, spiritual, or believe in a higher
+        # power, which is real and stays. We cap the *extreme* devotion, scaled
+        # by self-ID.
+        #
+        # Order matters: reconcile the self-ID FIRST (a no-religion person who
+        # ticked "a religious person" is itself inconsistent → mostly relabel to
+        # "not a religious person"), THEN run the god/belief reductions, so the
+        # newly-relabelled people are also caught. Doing it the other way round
+        # leaves relabelled cases sitting at god ~9 (the Robert bug).
+        if s.get("wvs_religious_self_id") == "A religious person" and random.random() < 0.75:
+            s["wvs_religious_self_id"] = "Not a religious person"
+
+        self_id = s.get("wvs_religious_self_id")
+        godv = s.get("wvs_importance_of_god")
+        # A self-described atheist who believes in God is a direct contradiction,
+        # independent of the God-importance score — reconcile belief first.
+        if self_id == "An atheist" and s.get("wvs_believe_in_god") == "Yes" \
+                and random.random() < 0.9:
+            s["wvs_believe_in_god"] = "No"
+        if isinstance(godv, (int, float)):
+            if self_id == "An atheist" and godv > 3 and random.random() < 0.9:
+                # A self-described atheist shouldn't rate God important.
+                s["wvs_importance_of_god"] = round(random.uniform(1.0, 3.0), 2)
+            elif self_id == "Not a religious person" and godv > 6 and random.random() < 0.95:
+                # "Not religious" is compatible with mild/moderate belief, not
+                # devotion. Pull god-importance down; the higher it started, the
+                # more certainly (a "not religious" person at 9-10/10 like the
+                # Robert case is the clearest contradiction).
+                ceiling = 5.5 if godv < 8 else 4.5
+                s["wvs_importance_of_god"] = round(random.uniform(2.0, ceiling), 2)
+                if godv >= 8 and s.get("wvs_believe_in_god") == "Yes" \
+                        and random.random() < 0.5:
+                    s["wvs_believe_in_god"] = "No"
+        # Extreme leftover: any non-religious self-ID still at god >= 8 (e.g. the
+        # 0.95 above didn't fire) is the hard Robert case — sweep it down. Read
+        # the CURRENT god value, not the captured one.
+        if self_id in ("An atheist", "Not a religious person") \
+                and isinstance(s.get("wvs_importance_of_god"), (int, float)) \
+                and s["wvs_importance_of_god"] >= 8 and random.random() < 0.95:
+            s["wvs_importance_of_god"] = round(random.uniform(2.0, 5.0), 2)
+        # A firmly non-religious person who also says religion is "very
+        # important" to them is contradictory; soften it.
+        if self_id in ("An atheist", "Not a religious person") \
+                and s.get("wvs_religion_importance") == "Very important" \
+                and random.random() < 0.7:
+            s["wvs_religion_importance"] = random.choices(
+                ["Not at all important", "Not very important", "Rather important"],
+                weights=[45, 40, 15], k=1)[0]
+
     # Religiosity spine: importance of God (Q164, 1–10) anchors the other
-    # religious-values items and moral traditionalism.
+    # religious-values items and moral traditionalism. For people with no stated
+    # religion, self-ID "a religious person" is itself inconsistent, so we don't
+    # treat a leftover high God score as grounds to re-inflate their religiosity
+    # (the else branch above already pulled the clear contradictions down).
     god = s.get("wvs_importance_of_god")
     religious_person = s.get("wvs_religious_self_id") == "A religious person"
-    high_relig = (isinstance(god, (int, float)) and god >= 7) or religious_person
+    high_relig = ((isinstance(god, (int, float)) and god >= 7) or religious_person) \
+        and (has_faith or religious_person)
     low_relig = (isinstance(god, (int, float)) and god <= 2) and \
                 s.get("wvs_religious_self_id") == "An atheist" and not has_faith
 
@@ -2342,6 +2398,22 @@ def _apply_wvs_correlations(s: dict) -> dict:
     if s.get("wvs_member_religious") in ("Active member", "Inactive member") \
             and s.get("wvs_believe_in_god") == "No" and random.random() < 0.9:
         s["wvs_believe_in_god"] = "Yes"
+
+    # A self-described ATHEIST who believes in God is a direct contradiction,
+    # regardless of affiliation. Run this LAST so the high-religiosity and
+    # member sweeps above can't re-introduce belief on an atheist. Resolve by
+    # dropping belief (mostly) or softening the self-ID (a minority mislabel
+    # themselves); an atheist who is also a religious-org member is doubly
+    # inconsistent, so drop that membership too.
+    if s.get("wvs_religious_self_id") == "An atheist":
+        if s.get("wvs_believe_in_god") == "Yes":
+            if random.random() < 0.85:
+                s["wvs_believe_in_god"] = "No"
+            else:
+                s["wvs_religious_self_id"] = "Not a religious person"
+        if s.get("wvs_religious_self_id") == "An atheist" \
+                and s.get("wvs_member_religious") in ("Active member", "Inactive member"):
+            s["wvs_member_religious"] = "Don't belong"
 
     return s
 
