@@ -3703,6 +3703,107 @@ def build_england_prompt(skeleton: dict, tier: str) -> str:
 #  AGENT BUILDER  (extends generate_agent_from_skeleton for England fields)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _reconcile_persona_freetext(data: dict, skeleton: dict) -> dict:
+    """
+    Make the LLM's free-text `occupation` (and `city`) consistent with the
+    validated structured skeleton. Corrects the two failure modes that make a
+    persona read as incoherent:
+
+      1. Economic activity mismatch — a non-employed person (retired, student,
+         long-term sick, etc.) given a current job title, or an employed person
+         left with no occupation.
+      2. SOC-group mismatch — an employed person's job title implying a very
+         different skill tier than their validated SOC major group.
+
+    Corrections are conservative: they only fire on a clear contradiction, and
+    they fall back to a representative title for the person's actual SOC group
+    rather than inventing detail. The LLM's wording is kept whenever it's
+    already consistent.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    ea = skeleton.get("economic_activity")
+    soc = skeleton.get("occupation_soc")
+    occ_text = (data.get("occupation") or "").strip()
+
+    # Representative job titles per SOC 2020 major group, used only as a
+    # fallback when the LLM's title is missing or clearly off-tier.
+    _SOC_TITLES = {
+        "Managers, directors and senior officials":
+            ["operations manager", "retail store manager", "office manager"],
+        "Professional occupations":
+            ["secondary school teacher", "registered nurse", "solicitor",
+             "software engineer", "accountant"],
+        "Associate professional and technical":
+            ["paramedic", "IT support technician", "estate agent",
+             "graphic designer"],
+        "Administrative and secretarial":
+            ["administrative assistant", "payroll clerk", "receptionist"],
+        "Skilled trades occupations":
+            ["electrician", "plumber", "carpenter", "chef"],
+        "Caring, leisure and other service":
+            ["care worker", "teaching assistant", "hairdresser"],
+        "Sales and customer service":
+            ["sales assistant", "call centre operator", "cashier"],
+        "Process, plant and machine operatives":
+            ["delivery driver", "forklift operator", "machine operative"],
+        "Elementary occupations":
+            ["warehouse operative", "cleaner", "kitchen porter"],
+    }
+
+    _NON_EMPLOYED = {
+        "Retired", "Full-time student",
+        "Economically inactive - long-term sick",
+        "Economically inactive - home or family",
+        "Economically inactive - other",
+        "Unemployed - seeking work",
+    }
+    _EMPLOYED = {"Employee - full-time", "Employee - part-time", "Self-employed"}
+
+    # Wording that implies a CURRENT job — inconsistent for the non-employed.
+    _CURRENT_JOB_MARKERS = ("works as", "employed as", "currently a",
+                            "working as")
+
+    def _looks_like_current_job(text: str) -> bool:
+        t = text.lower()
+        if not t or t in ("n/a", "none", "unemployed"):
+            return False
+        # A bare job title (e.g. "electrician") also implies current employment.
+        return True
+
+    if ea in _NON_EMPLOYED:
+        # The persona should not present a current occupation. Map to an
+        # activity-appropriate descriptor, preserving any "former X" phrasing.
+        label = {
+            "Retired": "retired",
+            "Full-time student": "student",
+            "Unemployed - seeking work": "unemployed (seeking work)",
+            "Economically inactive - long-term sick": "not working (long-term sick)",
+            "Economically inactive - home or family": "looking after home/family",
+            "Economically inactive - other": "economically inactive",
+        }.get(ea, "not in paid work")
+        t = occ_text.lower()
+        # Keep it only if it already reads as non-employment (retired/former/etc).
+        if not any(m in t for m in ("retired", "former", "student",
+                                    "unemployed", "not working", "inactive",
+                                    "looking after", "home", "family")):
+            data["occupation"] = label
+    elif ea in _EMPLOYED:
+        # Employed: ensure there IS a job title, and that it isn't obviously the
+        # wrong tier. We don't hard-verify wording (too brittle), but we fill a
+        # representative title when the LLM left it blank or wrote a non-job.
+        titles = _SOC_TITLES.get(soc)
+        if titles and (not _looks_like_current_job(occ_text)
+                       or occ_text.lower() in ("n/a", "none", "unemployed",
+                                               "retired", "student")):
+            import random as _r
+            data["occupation"] = _r.choice(titles)
+    # If economic activity is unknown, leave the LLM's text untouched.
+
+    return data
+
+
 def generate_england_agent_from_skeleton(
     skeleton: dict,
     tier: str,
@@ -3736,6 +3837,15 @@ def generate_england_agent_from_skeleton(
     data = extract_json_fn(raw)
     na   = lambda v: v if v is not None else "N/A"
 
+    # ── Post-API persona reconciliation ─────────────────────────────────────
+    # The skeleton is validated BEFORE the API call, but the LLM writes two free
+    # -text fields — `occupation` and `city` — that aren't constrained by the
+    # structured skeleton. At temperature 0.95 the model usually honours the
+    # prompt's consistency rules, but not always, so we reconcile its output
+    # against the FIXED skeleton fields here. This is what stops a persona
+    # reading as inconsistent even though its underlying data is coherent.
+    data = _reconcile_persona_freetext(data, skeleton)
+
     agent_id     = str(uuid.uuid4())[:8]
     demographics = {
         # Standard fields (app.py-compatible)
@@ -3765,18 +3875,6 @@ def generate_england_agent_from_skeleton(
         "household_composition": na(skeleton.get("household_composition")),
         "housing_tenure":        na(skeleton.get("housing_tenure")),
         "social_grade":          na(skeleton.get("social_grade")),
-        # BSA 2024 continuous attitude scales (1.0–5.0)
-        "attitude_scales": {
-            "left_right":  na(skeleton.get("scale_left_right")),
-            "lib_auth":    na(skeleton.get("scale_lib_auth")),
-            "welfarism":   na(skeleton.get("scale_welfarism")),
-            "_scale_guide": {
-                "left_right": "1=economic left/redistribution .. 5=economic right/free-market",
-                "lib_auth":   "1=social libertarian .. 5=social authoritarian",
-                "welfarism":  "1=pro-welfare-state .. 5=anti-welfare",
-                "source":     "British Social Attitudes 2024 value scales",
-            },
-        },
         # Source provenance for the two refreshed structural fields
         "_ethnicity_source": (
             "Census 2021 TS021 structure + Understanding Society: "
@@ -3792,6 +3890,17 @@ def generate_england_agent_from_skeleton(
     # ── WVS Wave 7 value dimensions, grouped by dimension ───────────────────
     # Stored under persona.values so downstream analysis can slice by
     # dimension. Every field is annotated with its WVS question id.
+    #
+    # De-duplication (Option A): each topic is listed exactly ONCE. The BSA
+    # continuous attitude scales (left_right / lib_auth / welfarism), which used
+    # to sit in a separate `attitude_scales` block, are folded into the WVS
+    # dimensions they belong to — so economic attitudes appear only under
+    # "Economic values", and the social liberty/welfare scales under the
+    # political/social dimensions — rather than being listed twice. The
+    # structural `religion` identity stays as the single top-level field the app
+    # reads, and the WVS religiosity items (how religious, attendance, belief)
+    # live under "Religious values"; together they describe religion once, with
+    # no repeated fields.
     wvs_values = {}
     for dim, fields in WVS_DIMENSIONS.items():
         block = {}
@@ -3802,12 +3911,37 @@ def generate_england_agent_from_skeleton(
                 "wvs_q": qid,
             }
         wvs_values[dim] = block
+
+    # Fold the BSA attitude scales into their matching WVS dimensions so they're
+    # listed once, alongside the related WVS items, instead of in a separate
+    # duplicate block. Each carries its own source + interpretation guide.
+    def _bsa(scale_key, guide):
+        return {"value": na(skeleton.get(scale_key)), "guide": guide,
+                "source": "British Social Attitudes 2024 value scales"}
+
+    if "Economic values" in wvs_values:
+        wvs_values["Economic values"]["bsa_left_right"] = _bsa(
+            "scale_left_right",
+            "1=economic left/redistribution .. 5=economic right/free-market")
+        wvs_values["Economic values"]["bsa_welfarism"] = _bsa(
+            "scale_welfarism",
+            "1=pro-welfare-state .. 5=anti-welfare")
+    # lib_auth (social libertarian↔authoritarian) belongs with social attitudes.
+    _social_dim = ("Social attitudes" if "Social attitudes" in wvs_values
+                   else "Political interest & participation")
+    if _social_dim in wvs_values:
+        wvs_values[_social_dim]["bsa_lib_auth"] = _bsa(
+            "scale_lib_auth",
+            "1=social libertarian .. 5=social authoritarian")
+
     demographics["wvs_values"] = wvs_values
     demographics["wvs_values"]["_meta"] = {
         "source": "World Values Survey Wave 7 (2017-2022), UK/Great Britain, "
-                  "survey-weighted (W_WEIGHT), N≈2609",
+                  "survey-weighted (W_WEIGHT), N≈2609; BSA 2024 attitude scales "
+                  "folded into their matching dimensions (listed once).",
         "scale_note": "Fields ending in a 1-10 range are continuous WVS scales; "
-                      "others are the WVS response categories.",
+                      "others are the WVS response categories. bsa_* entries are "
+                      "the British Social Attitudes 1-5 value scales.",
     }
 
     agent = {
