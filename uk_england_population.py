@@ -1203,6 +1203,52 @@ def _apply_marital_correlations(s: dict) -> dict:
     if not isinstance(age, int):
         return s
 
+    # ── Age ↔ number of children ────────────────────────────────────────────
+    # The `children` field is sampled from a flat distribution with no age
+    # signal, which produces impossibilities like an 18-year-old with three
+    # dependent children AND far too many young parents overall (the flat draw
+    # gives ~half of everyone at least one child regardless of age). Two
+    # corrections: (a) probabilistically ZERO OUT children for the young, to
+    # match real age-specific parenthood incidence (ONS: only a few % of under-
+    # 20s are parents; parenthood rises steeply through the 20s and 30s), and
+    # (b) CAP the count to what is plausible by age. Older ages are left alone.
+    kids = s.get("children")
+    if isinstance(kids, int) and kids > 0:
+        # (a) Incidence: probability of KEEPING any children at this age.
+        #     Below the numbers, most young "parents" are reset to zero.
+        if age < 18:
+            keep_p = 0.0
+        elif age < 20:
+            keep_p = 0.05      # ~a few % of 18-19s are parents
+        elif age < 23:
+            keep_p = 0.18
+        elif age < 26:
+            keep_p = 0.40
+        elif age < 30:
+            keep_p = 0.70
+        else:
+            keep_p = 1.0       # from 30+ leave the sampled count as-is
+        if random.random() > keep_p:
+            s["children"] = kids = 0
+
+    if isinstance(s.get("children"), int) and s["children"] > 0:
+        # (b) Count cap for those who do have children.
+        if age < 20:
+            cap = 1
+        elif age < 23:
+            cap = 2
+        elif age < 27:
+            cap = 3
+        else:
+            cap = 5
+        if s["children"] > cap:
+            # Land at the cap, occasionally one below, so the count is plausible.
+            if cap <= 1:
+                s["children"] = cap
+            else:
+                s["children"] = random.choices([cap - 1, cap], weights=[1, 3], k=1)[0]
+        kids = s["children"]
+
     # ── Age ↔ marital status ────────────────────────────────────────────────
     # Resample marital status from the age-appropriate table. This replaces the
     # flat-marginal draw entirely, because the flat draw carries no age signal
@@ -1259,16 +1305,33 @@ def _apply_marital_correlations(s: dict) -> dict:
                     ["One-person household", "Multi-person or other household"],
                     weights=[70, 30], k=1)[0]
         # Lone-parent household but no children recorded → give it children or
-        # reclassify, so the label and the child count agree.
+        # reclassify, so the label and the child count agree. For the young
+        # (who mostly won't have dependent children), reclassify instead of
+        # inventing them — consistent with the age→children incidence above.
         if (s.get("household_composition") == "Lone parent with dependent children"
                 and not has_kids):
-            s["children"] = random.choices([1, 2, 3], weights=[55, 33, 12], k=1)[0]
+            if age < 23:
+                s["household_composition"] = random.choices(
+                    ["One-person household", "Multi-person or other household"],
+                    weights=[45, 55], k=1)[0]
+            else:
+                kidmax = 2 if age < 27 else 3
+                opts = list(range(1, kidmax + 1))
+                wts = [55, 33, 12][:len(opts)]
+                s["children"] = random.choices(opts, weights=wts, k=1)[0]
 
     # Couple-with-children household but zero children → add children so the
     # household label is honoured (applies regardless of partnership branch).
+    # Reclassify for the young rather than inventing dependent children.
     if (s.get("household_composition") == "Couple with dependent children"
             and not (isinstance(s.get("children"), int) and s["children"] > 0)):
-        s["children"] = random.choices([1, 2, 3], weights=[45, 38, 17], k=1)[0]
+        if age < 23:
+            s["household_composition"] = "Couple, no dependent children"
+        else:
+            kidmax = 2 if age < 27 else 3
+            opts = list(range(1, kidmax + 1))
+            wts = [45, 38, 17][:len(opts)]
+            s["children"] = random.choices(opts, weights=wts, k=1)[0]
 
     return s
 
@@ -1789,8 +1852,39 @@ def _apply_attitude_correlations(s: dict) -> dict:
         if offset:
             s["scale_lib_auth"] = _clamp(la + offset)
 
-    # ── Economic left-right ↔ grade/income (WEAK) ───────────────────────────
+    # ── Political leaning (categorical) ↔ left-right scale ──────────────────
+    # The categorical `political_leaning` and the continuous `scale_left_right`
+    # (1=left … 5=right) are sampled independently, so a self-labelled "Right"
+    # agent can sit at a centrist/left scale value. Pull the scale toward the
+    # region implied by the stated leaning. This is the DOMINANT influence on
+    # the scale (a person's own left/right label predicts their scale position
+    # far better than their income does), so it runs before the weak
+    # grade/income tilt below and largely sets the value.
     lr = s.get("scale_left_right")
+    leaning = s.get("political_leaning")
+    # Target scale bands (1–5) for each leaning label.
+    _LEANING_TARGET = {
+        "Far left":          (1.0, 1.8),
+        "Left":              (1.6, 2.4),
+        "Center-left":       (2.2, 2.9),
+        "Center / Moderate": (2.6, 3.4),
+        "Center-right":      (3.1, 3.8),
+        "Right":             (3.6, 4.4),
+        "Far right":         (4.2, 5.0),
+        # Libertarian / Apolitical have no clean economic-axis position; leave.
+    }
+    if isinstance(lr, (int, float)) and leaning in _LEANING_TARGET:
+        lo, hi = _LEANING_TARGET[leaning]
+        # If already inside the plausible band, keep it; otherwise pull most of
+        # the way into the band (leaving a little spread for within-label
+        # variation and the occasional cross-pressured individual).
+        if not (lo <= lr <= hi):
+            target = random.uniform(lo, hi)
+            if random.random() < 0.85:
+                s["scale_left_right"] = _clamp(round(0.75 * target + 0.25 * lr, 2))
+        lr = s.get("scale_left_right")
+
+    # ── Economic left-right ↔ grade/income (WEAK) ───────────────────────────
     grade = s.get("social_grade", "")
     income = s.get("income_bracket")
     if isinstance(lr, (int, float)) and random.random() < 0.5:
@@ -2180,10 +2274,30 @@ def _apply_wvs_correlations(s: dict) -> dict:
         if s.get("wvs_vote_national") == "Never" and random.random() < 0.5:
             s["wvs_vote_national"] = random.choices(
                 ["Always", "Usually"], weights=[65, 35], k=1)[0]
-    elif interest == "Not at all interested":
-        if s.get("wvs_discuss_politics") == "Frequently" and random.random() < 0.7:
+    elif interest in ("Not at all interested", "Not very interested"):
+        # Low interest predicts LOW participation. Pull down the high-effort /
+        # high-engagement markers that sit oddly with disengagement: frequent
+        # discussion, always-voting, and having demonstrated. Stronger effect
+        # for "not at all" than "not very".
+        strong = interest == "Not at all interested"
+        if s.get("wvs_discuss_politics") == "Frequently" and random.random() < (0.75 if strong else 0.5):
             s["wvs_discuss_politics"] = random.choices(
                 ["Never", "Occasionally"], weights=[55, 45], k=1)[0]
+        if s.get("wvs_vote_national") == "Always" and random.random() < (0.5 if strong else 0.3):
+            s["wvs_vote_national"] = random.choices(
+                ["Usually", "Never"], weights=[60, 40], k=1)[0]
+        if s.get("wvs_action_demonstration") == "Have done" and random.random() < (0.65 if strong else 0.4):
+            s["wvs_action_demonstration"] = random.choices(
+                ["Might do", "Would never do"], weights=[55, 45], k=1)[0]
+
+    # Participation ladder: signing a petition is lower-effort than attending a
+    # demonstration, so "have demonstrated" but "would never sign a petition" is
+    # backwards. If someone has demonstrated, they should not rule out the
+    # easier act — upgrade the petition response.
+    if s.get("wvs_action_demonstration") == "Have done" \
+            and s.get("wvs_action_petition") == "Would never do":
+        s["wvs_action_petition"] = random.choices(
+            ["Have done", "Might do"], weights=[80, 20], k=1)[0]
 
     # Trust cohesion: low generalised trust (Q57) pulls institutional
     # confidence and stranger-trust down a little.
